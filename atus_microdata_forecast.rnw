@@ -1,0 +1,310 @@
+\documentclass{article}
+\usepackage[margin = 1in]{geometry}
+\usepackage{amsmath}
+\usepackage{parskip}
+\usepackage{url}
+\title{ATUS Microdata Forecasting (Example for Portfolio)}
+\author{Charles Ye}
+\date{}
+
+\begin{document}
+\maketitle
+
+<<echo = T, message = F>>=
+    library(tidyverse)
+    library(xtable)
+    library(glmnet) # Elastic Net
+    library(e1071) # SVM
+
+    # Settings for PDF compilation
+    knitr::opts_chunk$set(
+      echo = T, results = 'asis',
+      fig.width = 10, fig.height = 4, out.width = '5in', out.height = '2in',
+      fig.pos = '!h', fig.align = 'center', warnings = F, message = F
+      )
+    options(xtable.include.rownames = F)
+    options(xtable.size = 'footnotesize')
+    options(xtable.table.placement = '!h')
+
+@
+
+\section{Elastic Net Estimation}
+We use a microdata dataset compiled from the American Time Use Survey (ATUS), see \url{https://www.bls.gov/tus/}.
+<<>>=
+  ## Load Data from ATUS
+  tmp = tempfile()
+  download.file('https://www.bls.gov/tus/special.requests/atusresp-2019.zip', tmp)
+  df1 = unz(tmp, 'atusresp_2019.dat') %>% readr::read_delim(., delim = ',')
+  download.file('https://www.bls.gov/tus/special.requests/atussum-2019.zip', tmp)
+  df2 = unz(tmp, 'atussum_2019.dat') %>% readr::read_delim(., delim = ',')
+  download.file('https://www.bls.gov/tus/special.requests/atuscps-2019.zip', tmp)
+  df3 = unz(tmp, 'atuscps_2019.dat') %>% readr::read_delim(., delim = ',')
+  # Join datasets together by hh respondent ID 
+  # (join ATUS-CPS by both hh & individual respondent ID)
+  df =
+    df1 %>%
+    dplyr::inner_join(., df2, by = 'TUCASEID') %>%
+    dplyr::inner_join(., df3, by = c('TUCASEID', 'TULINENO'))
+  unlink(tmp)
+  rm(df1, df2, df3, tmp)
+  
+  # Data dictionary https://www.bls.gov/tus/atusintcodebk19.pdf
+  sleepDf =
+    df %>%
+    dplyr::transmute(
+      .,
+      time_sleeping = t010101,
+      time_insomnia = t010102,
+      age = TEAGE,
+      is_male = ifelse(TESEX == 1, 1, 0),
+      is_student = ifelse(TESCHFT == 1, 1, 0),
+      is_employed = ifelse(TELFS.x %in% c(1, 2), 1, 0),
+      has_children = ifelse(TRNHHCHILD == 1, 1, 0),
+      number_children = TRCHILDNUM.x,
+      age_youngest_child = TRYHHCHILD.x,
+      weekly_earnings = PEERN,
+      hh_size = HRNUMHOU,
+      spouse_hours = TESPUHRS,
+      hours_working = TEHRUSLT.x,
+      time_alone = TRTALONE_WK,
+      time_childcare = TRTCHILD,
+      time_family = TRTFAMILY,
+      time_friends = TRTFRIEND,
+      time_eldercare = TRTEC.x
+      ) %>%
+    dplyr::mutate_all(., function(x) as.numeric(x))
+  
+  rm(df)
+@
+
+Our dataset comprises of \Sexpr{nrow(sleepDf)} observations and \Sexpr{ncol(sleepDf)} variables: \textit{\Sexpr{sleepDf %>% colnames(.) %>% xtable::sanitize(.) %>% paste0(., collapse = ', ')}}. The first variable, number of minutes slept in the previous day, will be the dependent variable. The other 17 variables have been selected from the original ATUS dataset as they seem likely to have some relationship with time sleeping; these variables will be the independent variables in our models.\\
+
+
+As an example, the below table shows the first 10 observations and first 8 variables in our dataset.\\
+<<>>=
+  sleepDf %>%
+    .[1:10, 1:8] %>%
+    xtable(., caption = 'First 5 Observations') %>%
+    print(.)
+@
+The dataset is then split into a test set and a training set.\\
+
+<<>>=
+  trainDf = sleepDf[1:(floor(nrow(sleepDf)/2)),]
+  testDf = sleepDf[floor(nrow(sleepDf)/2 + 1):(nrow(sleepDf)),]
+@
+
+Next, we estimate hyperparameters to conduct elastic net regularization on the model. We iterate through $\alpha = 0, .1, .2, \dots, 1$ and use the \texttt{cv.glmnet} function to iterate over $\lambda$ values for each $\alpha$. At each $(\alpha, \lambda)$ pair, the MSE resulting from 10-fold cross-validation is conducted. The graph below shows the minimum $\lambda$ value at each $\alpha$, as well as the $(\alpha, \lambda)$ pair resulting in the lowest overall MSE. The corresponding table shows the exact values for the hyperparmeters which give the lowest overall MSE.\\
+<<>>=
+  set.seed(123123)
+  folds = sample(1:10, nrow(trainDf), replace = TRUE)
+  
+  # Iterate through alpha = 0, .1, ..., 1 and select the optimal lambda at each
+  glmResult = lapply(seq(0, 1, .1), function(.alpha) {
+    cv =
+      glmnet::cv.glmnet(
+        x = trainDf %>% dplyr::select(., -time_sleeping) %>% as.matrix(.),
+        y = trainDf %>% dplyr::select(., time_sleeping) %>% as.matrix(.),
+        foldid = folds,
+        alpha = .alpha
+      )
+    
+    tibble(alpha = .alpha, lambda = cv$lambda, mse = cv$cvm) %>%
+      dplyr::mutate(., min_lambda_for_given_alpha = (mse == min(mse))) %>%
+      return(.)
+    }) %>%
+    dplyr::bind_rows(.) %>%
+    dplyr::mutate(., min_overall = (mse == min(mse)))
+  
+  glmOptim = glmResult %>% dplyr::filter(., min_overall == TRUE)
+    
+  cvPlot =
+    glmResult %>%
+    ggplot(.) +
+    geom_line(aes(x = log(lambda), y = mse, group = alpha, color = alpha)) +
+    geom_point(
+      data = glmResult %>% dplyr::filter(., min_lambda_for_given_alpha == TRUE),
+      aes(x = log(lambda), y = mse), color = 'red'
+      ) +
+    geom_point(
+      data = glmResult %>% dplyr::filter(., min_overall == TRUE),
+      aes(x = log(lambda), y = mse), color = 'green'
+      ) +
+    labs(
+      x = 'log(Lambda)', y = 'MSE', color = 'alpha',
+      title = 'Elastic Net Hyperparameter Fit',
+      subtitle = 'Red = MSE Minimizing Lambda for Given Alpha;
+      Green = MSE Minimizing (Lambda, Alpha) Pair'
+      )
+@
+
+Next, we estimate hyperparameters to conduct elastic net regularization on the model. We iterate through $\alpha = 0, .1, .2, \dots, 1$ and use the \texttt{cv.glmnet} function to iterate over $\lambda$ values for each $\alpha$. At each $(\alpha, \lambda)$ pair, the MSE resulting from 10-fold cross-validation is conducted. The graph below shows the minimum $\lambda$ value at each $\alpha$, as well as the $(\alpha, \lambda)$ pair resulting in the lowest overall MSE. The corresponding table shows the exact values for the hyperparmeters which give the lowest overall MSE.\\
+<<fig.caption = 'Elastic Net Hyperparameter Search'>>=
+  print(cvPlot)
+@
+<<>>=
+  glmOptim %>%
+    xtable(., caption = 'Optimal Hyperparameters') %>%
+    print(.)
+@
+
+These hyperparameters are then used to estimate the coefficients, shown in the below table. Note that two coefficients have been shrunken to zero and effectively removed from the regression, indicating these coefficients had little predictive power.\\
+
+
+<<>>=
+  glmObj =
+    glmnet::glmnet(
+      x = trainDf %>% dplyr::select(., -time_sleeping) %>% as.matrix(.),
+      y = trainDf %>% dplyr::select(., time_sleeping) %>% as.matrix(.),
+      alpha = glmOptim$alpha,
+      lambda = glmOptim$lambda
+    )
+  
+  coefMat = glmObj %>% coef(.) %>% as.matrix(.)
+
+  coefMat %>%
+    as.data.frame(.) %>%
+    rownames_to_column(., var = 'Covariate') %>%
+    setNames(., c('Covariate', 'Estimate')) %>%
+    xtable(., caption = 'Elastic Net Estimates', digits = 5) %>%
+    print(.)
+@
+We then multiply the coefficient matrix by the test data matrix to get the predicted values of \texttt{time\_sleep}. Then we subtract these from the actual test data to get the residuals. Goodness-of-fit statistics are shown below.\\
+<<>>=
+  # OOS fitting
+  oosFit =
+    testDf %>%
+    dplyr::select(., -time_sleeping) %>%
+    dplyr::bind_cols(constant = 1, .) %>%
+    as.matrix(.) %>%
+    {. %*% coefMat} %>%
+    as.data.frame(.) %>%
+    as_tibble(.) %>%
+    setNames(., 'yhat')
+  
+  # Get residuals and goodness-of-fit statistics
+  gofDf =
+    oosFit %>%
+    dplyr::bind_cols(., y = testDf$time_sleeping) %>%
+    dplyr::mutate(., resids = y - yhat) %>%
+    dplyr::summarize(., MAE = mean(abs(resids)), SSE = sum(resids^2), MSE = mean(resids^2))
+  
+  gofDf %>%
+    xtable(., caption = 'Elastic Net OOS Goodness-of-Fit') %>%
+    print(.)
+@
+Finally, we run a typical OLS regression on the same training dataset. Coefficients are shown below.\\
+<<>>=
+  lm(time_sleeping ~ ., sleepDf) %>%
+    xtable(., caption = 'OLS Regression Results') %>%
+    print(., include.rownames = TRUE)
+@
+We find the predicted values by using the OLS estimated coefficients on the test data matrix. Residuals are calculated and goodness-of-fit statistics are shown below.\\
+<<>>=
+  # Now compare to regular OLS
+  olsOosFit =
+    testDf %>%
+    dplyr::select(., -time_sleeping) %>%
+    dplyr::bind_cols(constant = 1, .) %>%
+    as.matrix(.) %>%
+    {. %*% coef(lm(time_sleeping ~ ., sleepDf))} %>%
+    as.data.frame(.) %>%
+    as_tibble(.) %>%
+    setNames(., 'yhat')
+  
+  olsGofDf =
+    olsOosFit %>%
+    dplyr::bind_cols(., y = testDf$time_sleeping) %>%
+    dplyr::mutate(., resids = y - yhat) %>%
+    dplyr::summarize(., MAE = mean(abs(resids)), SSE = sum(resids^2), MSE = mean(resids^2))
+
+  olsGofDf %>%
+    xtable(., caption = 'OLS OOS Goodness-of-Fit') %>%
+    print(.)
+@
+
+OLS ends up providing a better out-of-sample fit than the elastic net process. This is likely because in the OLS results, almost all the regression coefficients are significant, suggesting that they all have some predictive power on \texttt{time\_sleeping}. This implies that any shrinkage of covariates from the elastic net regularization process will have little positive effect on out-of-sample forecasting. This tells us that standard OLS may be a better choice than machine learning techniques when the covariates are intuitively and clearly relevant to the dependent variable.\\
+
+
+
+\clearpage
+\section{SVM Estimation}
+
+<<>>=
+  # Create dataset
+  sleepDf2 =
+    sleepDf %>%
+    dplyr::mutate(., has_insomnia = ifelse(time_insomnia > 0, 1, 0)) %>%
+    dplyr::mutate(., has_insomnia = as.factor(has_insomnia)) %>%
+    dplyr::select(., -time_insomnia)
+  
+  trainDf = sleepDf2[1:(floor(nrow(sleepDf2)/2)),]
+  testDf = sleepDf2[floor(nrow(sleepDf2)/2 + 1):(nrow(sleepDf2)),]
+  
+  set.seed(12345)
+  # Tune hyperparameters of SVM
+  tuneRes =
+    tune.svm(
+      has_insomnia ~ ., data = sleepDf2, kernel = 'radial',
+      type = 'C-classification', cost = 2^(0:1)
+      )
+
+  tuneRes2 =
+    tune.svm(
+      has_insomnia ~ ., data = sleepDf2,
+      kernel = 'linear', type = 'C-classification', cost = 2^(0:1)
+      )
+  
+  # Do OOS testing of SVM
+  svmFit =
+    tuneRes$best.model %>%
+    predict(., newdata = testDf %>% dplyr::select(., -has_insomnia))    
+  
+  svmGofDf =
+    tibble(yhat = svmFit, y = testDf$has_insomnia) %>%
+    dplyr::mutate(., resids = as.numeric(y) - as.numeric(yhat)) %>%
+    dplyr::summarize(., MAE = mean(abs(resids)), SSE = sum(resids^2), MSE = mean(resids^2))
+
+  # Run regular logit model and do OOS testing
+  glmGofDf =
+    glm(has_insomnia ~ ., data = trainDf, family = 'binomial') %>%
+    predict(
+      .,
+      newdata = testDf %>% dplyr::select(., -has_insomnia),
+      type = 'response'
+      ) %>%
+    tibble(yhat = ., y = testDf$has_insomnia) %>%
+    dplyr::mutate(., resids = as.numeric(y) - as.numeric(yhat)) %>%
+    dplyr::summarize(., MAE = mean(abs(resids)), SSE = sum(resids^2), MSE = mean(resids^2))
+  
+@
+We now alter the dataset used previously to create a new dependent variable, \texttt{has\_insomnia}, a binary variable indicating whether the individual experienced any minutes of insomnia over the past week. Our independent variables are now \textit{\Sexpr{sleepDf2 %>% colnames(.) %>% .[1:(length(.) - 1)] %>% xtable::sanitize(.) %>% paste0(., collapse = ', ')}}.\\
+
+As before, we break up the dataset into a testing and training dataset. We run two alternative kernels, radial and linear, and use the \texttt{tune} function to perform a grid search over the cost functions $2^0, 2^1, \dots, 2^5$. We find that the lowest error is provided by the linear kernel with cost function 1.\\
+
+We fit this SVM model to the test dataset and derive the following out-of-sample goodness-of-fit statistics for the residuals.\\
+<<>>=
+  svmGofDf %>%
+    xtable(., caption = 'SVM Goodness-of-Fit') %>%
+    print(.)
+@
+
+To benchmark the SVM model, we fit a standard logit model as well and derive the coefficient estimates below.\\
+<<>>=
+  glm(has_insomnia ~ ., data = trainDf, family = 'binomial') %>%
+    xtable(., caption = 'Logit Model Fit') %>%
+    print(., include.rownames = TRUE)
+@
+
+<<>>=
+  glmGofDf %>%
+    xtable(., caption = 'Logit Model Goodness-of-Fit') %>%
+    print(.)
+@
+
+Comparison of the out-of-sample testing results between the models suggests that SVM performs the better fit. This is likely because the data is high-dimensional but we have relatively few observations; moreover the independent variables likely have a nonlinear relationship with the dependent variable (e.g. demographic covariates like age tend to have nonlinear, nonmonotonic effects on a person's likelihood of having insomnia).
+
+
+
+
+\end{document}
